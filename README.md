@@ -32,6 +32,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
    6. 端口验证   Verify port capability    ~1 min
    7. 回滚改动   Rollback all changes
    8. 检查更新   Check for updates
+   9. 调优存档   Tuning archives
+   u. 卸载 tcpfit
 ```
 
 脚本不会自动更新. 装好之后跑的一直是装的那一版, 想升级用菜单 8 或 `tcpfit update` ——
@@ -62,6 +64,12 @@ tcpfit verify   --peer <近处iperf3服务器>          # 测速验证
 tcpfit status                                     # 当前配置
 tcpfit rollback                                   # 回滚全部改动
 tcpfit update                                     # 检查更新
+tcpfit archive list                               # 列出存档
+tcpfit archive save "晚间配置"                     # 保存当前状态
+tcpfit archive restore 0010                       # 恢复第 10 份存档
+tcpfit archive rename 0010 "备用配置"              # 存档改名
+tcpfit archive delete 0010                        # 删除指定存档
+tcpfit uninstall --keep-archives                  # 卸载，保留存档和快照
 ```
 
 ## 多机（未上线）
@@ -119,6 +127,17 @@ tcpfit shape --off    # 只去掉整形
 ```
 
 首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 32 项参数的原始值.
+
+0.5.7 起，原始快照同时保留为 `0000 出厂状态`，不可改名或单独删除。
+`archive restore 0000` 与 `rollback` 使用同一回滚流程；“出厂状态”指首次调优前的快照。
+普通存档位于 `/var/lib/tcpfit/archives/`。基础调优后自动保存，一键调优则在最终整形、验证完成后保存。
+序号可以输入 `10` 或 `0010`；名字含空格时请加引号。
+
+恢复普通存档会同步 sysctl 启动配置和整形服务。有路由窗口设置时沿用 networkd-dispatcher hook；
+缺少该目录会提示路由只能即时恢复并返回失败。恢复失败可能已经应用部分设置，请按提示检查后重试。
+
+`tcpfit uninstall` 默认删除存档；需要保留则加 `--keep-archives`。
+若回滚失败，卸载会停止并保留存档。卸载不删除 swap、iperf3 或 ping。
 
 swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要一并撤销得显式加 `--purge-swap`.
 

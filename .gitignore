@@ -6,7 +6,20 @@ results/*.json
 __pycache__/
 
 # 项目记忆, 内部用, 不发布
-CLAUDE.md
-docs/FINDINGS.md
+CLAUDE.md*
+# 整个 docs/ 私有. 注意 .gitignore 不支持行尾注释, # 只有行首才算
+docs/
 promo/
-HANDOFF.md
+HANDOFF.md*
+MACHINES.md*
+results/
+test-v055.sh
+CUSTOMERS.md*
+tools/
+reports/
+
+# 备份文件一律忽略. 私有文件的规则要写成前缀匹配(如 MACHINES.md*),
+# 只写精确文件名会漏掉 .bak / .old 之类的变体
+*.bak
+*.bak*
+*~

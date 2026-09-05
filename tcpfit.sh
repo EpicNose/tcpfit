@@ -14,19 +14,30 @@
 #   tcpfit.sh harden --swap 2G              加 swap（小内存机防止进程被杀）
 #   tcpfit.sh verify [--peer HOST]          验证当前状态
 #   tcpfit.sh status                        显示当前配置
-#   tcpfit.sh rollback                      回滚到调优前
+#   tcpfit.sh rollback                      回滚到出厂（= archive restore 0000）
+#   tcpfit.sh archive list                  列出所有调优存档
+#   tcpfit.sh archive save [名字]           把当前状态存成新存档
+#   tcpfit.sh archive restore <序号|名字>   回滚到指定存档
+#   tcpfit.sh archive rename <序号> <名字>  改名（0000 不可改）
+#   tcpfit.sh archive delete <序号>         删除（0000 不可删）
+#   tcpfit.sh uninstall [--keep-archives]   卸载：回滚 + 删配置 + 删自己
+#
+# 运行计数: 启动时会向 tcpfit.spacevps.cc 发一次匿名计数请求（纯计数, 不含任何
+#           机器标识, 只带版本号）, 用于显示"今天多少次 / 累计多少次".
+#           关掉:  TCPFIT_NO_TELEMETRY=1   或   touch /var/lib/tcpfit/no-telemetry
 #
 # 退出码: 0 成功 / 1 参数或环境错误 / 2 实测失败
 
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.6"
+VERSION="0.5.7"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
 QDISC_UNIT="/etc/systemd/system/tcpfit-qdisc.service"
 ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd"
+BBR_MODULE_FILE="/etc/modules-load.d/tcpfit-bbr.conf"
 INITCWND_MARKER="$STATE_DIR/initcwnd.owned"
 SNAPSHOT="$STATE_DIR/pre-tune.snapshot"
 FACTS="$STATE_DIR/facts"
@@ -682,6 +693,198 @@ TUNED_KEYS="
 "
 
 # ── 快照与回滚 ──────────────────────────────────────────────────────────────
+# ── 包管理器锁诊断 ──────────────────────────────────────────────────────────
+# 装 iperf3 失败最常见的原因不是"没网"或"包不存在", 而是 dpkg 锁被占:
+# Ubuntu/Debian 首次开机 unattended-upgrades 会跑 5~30 分钟, 期间任何 apt 都装不上.
+# 实测现场: 一台新开的机器 unattended-upgrades 占锁 20+ 分钟, tcpfit 静默降级成
+# "只能基础调优", 用户以为是工具坏了.
+apt_lock_holder(){   # 有锁则输出 "PID 进程名 已运行时长", 否则输出空
+  local f pids p cmd age
+  command -v fuser >/dev/null 2>&1 || return 0
+  for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+           /var/cache/apt/archives/lock /var/lib/apt/lists/lock; do
+    [ -e "$f" ] || continue
+    pids=$(fuser "$f" 2>/dev/null | tr -s ' ' '\n' | grep -x '[0-9]*')
+    for p in $pids; do
+      [ "$p" = "$$" ] && continue
+      cmd=$(ps -o comm= -p "$p" 2>/dev/null)
+      age=$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' ')
+      [ -n "$cmd" ] && { printf '%s %s %s' "$p" "$cmd" "${age:-?}"; return 0; }
+    done
+  done
+  return 0
+}
+
+# 装包失败时讲清楚到底怎么回事, 而不是只说"没有 iperf3"
+explain_pkg_failure(){   # explain_pkg_failure [包名]
+  local pkg="${1:-iperf3}" holder up_s up_min
+  holder=$(apt_lock_holder)
+  up_s=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 99999)
+  up_min=$(( up_s / 60 ))
+
+  echo >&2
+  warn "${pkg} 没装上. 原因："
+  if [ -n "$holder" ]; then
+    set -- $holder
+    warn "  包管理器正被占用 —— PID $1（$2）已运行 $3"
+    case "$2" in
+      unattended-upg*|apt-get|apt|aptd|dpkg|packagekitd)
+        warn "  这是系统在自动装更新, 不是故障. 它跑完就能装了."
+        ;;
+      *) warn "  有另一个程序正在装东西, 等它结束." ;;
+    esac
+    echo >&2
+    echo "    等它结束（通常 5~30 分钟，新机器可能更久）：" >&2
+    echo "      while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 10; done; echo 可以了" >&2
+    echo >&2
+    echo "    想看它在干什么：" >&2
+    echo "      journalctl -u unattended-upgrades -f      # 自动更新的日志" >&2
+    echo "      ps -fp $1" >&2
+  elif [ "$up_min" -lt 15 ]; then
+    warn "  这台机器刚开机 ${up_min} 分钟."
+    warn "  新装的 Ubuntu/Debian 开机后会自动跑一轮系统更新, 期间装不了别的包."
+    echo >&2
+    echo "    等几分钟再跑一次就行. 想确认是不是它：" >&2
+    echo "      systemctl is-active unattended-upgrades apt-daily.service" >&2
+  elif ! command -v apt-get >/dev/null && ! command -v dnf >/dev/null && \
+       ! command -v yum >/dev/null && ! command -v apk >/dev/null; then
+    warn "  认不出这台机器的包管理器."
+    echo "    手动装好 iperf3 再重跑." >&2
+  else
+    warn "  包管理器没被占用, 装包命令本身失败了."
+    echo >&2
+    echo "    手动跑一次看真实报错：" >&2
+    if command -v apt-get >/dev/null; then echo "      apt-get update && apt-get install -y ${pkg}" >&2
+    elif command -v dnf >/dev/null;    then echo "      dnf install -y ${pkg}" >&2
+    elif command -v yum >/dev/null;    then echo "      yum install -y ${pkg}" >&2
+    elif command -v apk >/dev/null;    then echo "      apk add ${pkg}" >&2; fi
+    echo "    常见原因: 没配软件源 / DNS 不通 / 磁盘满（df -h /）" >&2
+  fi
+  echo >&2
+}
+
+# ── ping 变种识别 ───────────────────────────────────────────────────────────
+# `command -v ping` 存在【不代表能用】. 有服务商模板装的是 GNU inetutils 的 ping,
+# 它不认 -4, 而 auto_pick_peer 是 `ping $IP_FAMILY ...`, IP_FAMILY 默认 -4 ——
+# 18 个候选节点全部取不到 RTT, 最后报「公共测速服务器暂时都不可用」, 在甩锅给对端.
+# 一台客户机实证: 把 -4 去掉后立刻选中最近的节点, RTT 2ms.
+#
+# 判定方式用"直接试"而不是解析 -V —— BusyBox 连 -V 都报 invalid option.
+# 只看选项是否被拒, 不看 ping 本身通不通(有的机房挡 ICMP, 那是另一回事).
+ping_supports_4(){
+  local out
+  out=$(ping -4 -c 1 -W 1 127.0.0.1 2>&1)
+  case "$out" in
+    *"invalid option"*|*"unrecognized option"*|*"illegal option"*|*"unknown option"*) return 1 ;;
+  esac
+  return 0
+}
+
+ping_variant(){
+  command -v ping >/dev/null 2>&1 || { echo none; return; }
+  ping_supports_4 && { echo iputils; return; }
+  case "$(ping -V 2>&1 | head -1)" in
+    *"GNU inetutils"*) echo inetutils ;;
+    *BusyBox*|*busybox*) echo busybox ;;
+    *) echo unknown ;;
+  esac
+}
+
+# 装 iputils-ping. 成功返回 0.
+install_iputils(){
+  local holder; holder=$(apt_lock_holder)
+  if [ -n "$holder" ]; then
+    set -- $holder
+    warn "包管理器正被 PID $1（$2, 已运行 $3）占用, 装不了."
+    return 1
+  fi
+  if   command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1; apt-get install -y iputils-ping >/dev/null 2>&1
+  elif command -v dnf     >/dev/null; then dnf install -y iputils >/dev/null 2>&1
+  elif command -v yum     >/dev/null; then yum install -y iputils >/dev/null 2>&1
+  elif command -v apk     >/dev/null; then apk add iputils >/dev/null 2>&1
+  else return 1; fi
+  ping_supports_4
+}
+
+# 向导里调用: ping 存在但不是 iputils 时, 说清楚并尝试换掉
+check_ping_variant(){
+  local v; v=$(ping_variant)
+  case "$v" in
+    iputils) return 0 ;;
+    none)    return 1 ;;   # 没装 ping, 由原有分支处理
+  esac
+  echo
+  case "$v" in
+    inetutils) warn "本机的 ping 是 GNU inetutils 版, 它不认 -4 参数." ;;
+    busybox)   warn "本机的 ping 是 BusyBox 版, 参数不全." ;;
+    *)         warn "本机的 ping 不认 -4 参数." ;;
+  esac
+  warn "  后果: 自动选对端会拿不到任何节点的延迟, 最后报「公共测速服务器暂时都不可用」."
+  warn "  那句话是在甩锅给对端 —— 其实是本机 ping 的问题."
+  echo
+  echo "  换成标准的 iputils-ping 就好. 它只替换 ping 这一个包,"
+  echo "  inetutils 的其他命令（telnet 等）不受影响, ping6 也仍然在."
+  echo
+  if confirm "  现在换？" y; then
+    if install_iputils; then
+      ok "已换成 $(ping -V 2>&1 | head -1)"
+      return 0
+    fi
+    warn "换失败了."
+    explain_pkg_failure iputils-ping
+    warn "手动装: apt install -y iputils-ping  /  dnf install -y iputils"
+    warn "或者在选对端那一步手动填一个 iperf3 服务器地址."
+  else
+    warn "跳过. 自动选对端多半会失败, 到时候手动填对端地址."
+  fi
+  return 1
+}
+
+# ── 运行计数 ────────────────────────────────────────────────────────────────
+# 纯计数: 跑一次算一次, 不生成也不发送任何机器标识, 服务端无法区分
+# "一台机器跑十次" 和 "十台各跑一次". 只额外带版本号, 用来判断旧版还有多少人在用.
+#
+# 关掉:  TCPFIT_NO_TELEMETRY=1   或   touch /var/lib/tcpfit/no-telemetry
+#
+# 三条硬约束:
+#   1. 后台发, 绝不阻塞任何一步 —— 统计挂了/域名没了/用户在墙内, 调优照跑
+#   2. 超时 3 秒, 失败静默
+#   3. 界面显示的是【上一次拿到的】缓存值, 所以永远不会为它等待
+STATS_URL="https://tcpfit.spacevps.cc/ping"
+STATS_CACHE="$STATE_DIR/stats.json"
+
+telemetry_off(){
+  [ -n "${TCPFIT_NO_TELEMETRY:-}" ] && return 0
+  [ -f "$STATE_DIR/no-telemetry" ] && return 0
+  return 1
+}
+
+# 后台打一次, 结果写进缓存供【下次】显示. 不等待, 不检查返回码.
+telemetry_ping(){
+  telemetry_off && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  (
+    out=$(curl -fsS --max-time 3 "${STATS_URL}?v=${VERSION}" 2>/dev/null) || exit 0
+    # 只接受长得像 {"today":N,"total":N} 的东西, 别把错误页写进缓存
+    case "$out" in
+      *'"today"'*'"total"'*) printf '%s' "$out" > "$STATS_CACHE" 2>/dev/null ;;
+    esac
+  ) >/dev/null 2>&1 &
+  return 0
+}
+
+# 读缓存, 给 banner 用. 没有缓存就返回空, banner 那一行整个不显示.
+telemetry_line(){
+  telemetry_off && return 0
+  [ -f "$STATS_CACHE" ] || return 0
+  local t n
+  t=$(sed -n 's/.*"today"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$STATS_CACHE" 2>/dev/null)
+  n=$(sed -n 's/.*"total"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$STATS_CACHE" 2>/dev/null)
+  [ -n "$t" ] && [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || return 0
+  printf '今天 %s 次 · 累计 %s 次' "$t" "$n"
+}
+
 take_snapshot(){
   mkdir -p "$STATE_DIR"
   [ -f "$SNAPSHOT" ] && { info "Snapshot already exists, keeping the earliest one"; return; }
@@ -707,13 +910,440 @@ take_snapshot(){
     echo "# qdisc: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
   } > "$SNAPSHOT"
   ok "Snapshot saved: $SNAPSHOT"
+  # 出厂状态同时存成 0000 存档 —— 名字固定, 后面不允许改名或删除
+  mkdir -p "$ARCHIVE_DIR" 2>/dev/null
+  [ -n "$(archive_path 0 2>/dev/null)" ] || {
+    cp -a "$SNAPSHOT" "$ARCHIVE_DIR/0000-${ARCHIVE_ZERO_NAME}.snap" 2>/dev/null &&
+      info "已建立存档 0000 ${ARCHIVE_ZERO_NAME}（出厂状态, 不可改名/删除）"
+  }
+}
+
+# ── 调优存档 ────────────────────────────────────────────────────────────────
+# 每次调优存一份完整状态: 参数 + sysctl + 路由 initcwnd + 整形值 + 拐点结果.
+# 0000 是出厂状态, 名字固定、不可改名、不可删除、永远排最前 —— 它是最后的退路,
+# 一旦被改写或删掉, 机器就再也回不到没被动过的样子.
+ARCHIVE_DIR="$STATE_DIR/archives"
+ARCHIVE_ZERO_NAME="出厂状态"
+
+# 名字里不能有 / 和换行(会破坏文件名和逐行解析), 长度截到 40 个字符.
+# 字节数转人话. 212992 显示成 0MB 会让人以为没设置, 所以小于 1MB 时用 KB.
+# 2026-09-04T01:25:42Z -> "2026-09-04 01:25". 老快照是裸日期, 原样返回.
+fmt_created(){
+  local c="${1:-}" t
+  case "$c" in
+    *T*Z) t="${c#*T}"; printf '%s %s' "${c%%T*}" "$(printf '%s' "$t" | cut -c1-5)" ;;
+    "")   printf '?' ;;
+    *)    printf '%s' "$c" ;;
+  esac
+}
+
+human_bytes(){
+  local b="${1:-0}"
+  if   [ "$b" -ge 1048576 ] 2>/dev/null; then printf '%d MB' $(( b / 1048576 ))
+  elif [ "$b" -ge 1024 ]    2>/dev/null; then printf '%d KB' $(( b / 1024 ))
+  else printf '%s B' "$b"; fi
+}
+
+archive_sanitize(){ printf '%s' "$1" | tr -d '\n\r/' | cut -c1-40; }
+
+archive_path(){   # 按序号取存档路径
+  local seq="$1"
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  # 用字符串去掉前导零再补齐，避免八进制和超长数字的整数溢出。
+  while [ "${#seq}" -gt 1 ] && [ "${seq#0}" != "$seq" ]; do seq=${seq#0}; done
+  seq=$(printf '%4s' "$seq"); seq=${seq// /0}
+  find "$ARCHIVE_DIR" -maxdepth 1 -name "${seq}-*.snap" 2>/dev/null | head -1
+}
+archive_seq_of(){ local b; b=$(basename "$1"); printf '%s' "${b%%-*}"; }
+archive_name_of(){ local b; b=$(basename "$1" .snap); printf '%s' "${b#*-}"; }
+
+archive_next_seq(){
+  local last=-1 f s
+  for f in "$ARCHIVE_DIR"/*.snap; do
+    [ -e "$f" ] || continue
+    s=$(archive_seq_of "$f"); s=$((10#$s))
+    [ "$s" -gt "$last" ] && last=$s
+  done
+  printf '%04d' $(( last + 1 ))
+}
+
+# 老版本只有 pre-tune.snapshot. 有它没有 0000 时, 原样搬成 0000 ——
+# 它就是那台机器的出厂状态, 不能丢.
+archive_migrate(){
+  mkdir -p "$ARCHIVE_DIR" 2>/dev/null || return 0
+  [ -n "$(archive_path 0)" ] && return 0
+  [ -f "$SNAPSHOT" ] || return 0
+  cp -a "$SNAPSHOT" "$ARCHIVE_DIR/0000-${ARCHIVE_ZERO_NAME}.snap" 2>/dev/null &&
+    info "已把旧快照收进存档 0000 ${ARCHIVE_ZERO_NAME}"
+}
+
+# archive_write <序号> <名字>  —— 把当前状态写成存档
+archive_write(){
+  local seq="$1" name="$2" iface rate f tmp
+  mkdir -p "$ARCHIVE_DIR" || return 1
+  iface=$(detect_iface)
+  rate=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+  f="$ARCHIVE_DIR/${seq}-${name}.snap"
+  tmp=$(mktemp "$ARCHIVE_DIR/.archive.XXXXXX") || return 1
+  {
+    echo "# tcpfit archive"
+    echo "SEQ=$seq"
+    echo "NAME=$name"
+    echo "CREATED=$(date -u +%FT%TZ)"
+    echo "CREATED_LOCAL=$(date +'%F %T %Z')"
+    echo "TZ_NAME=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo '?')"
+    echo "TCPFIT_VERSION=$VERSION"
+    echo "KERNEL=$(uname -r)"
+    [ -n "${ARCH_ROLE:-}" ] && echo "PARAM_ROLE=$ARCH_ROLE"
+    [ -n "${ARCH_BW:-}"   ] && echo "PARAM_BW=$ARCH_BW"
+    [ -n "${ARCH_RTT:-}"  ] && echo "PARAM_RTT=$ARCH_RTT"
+    [ -n "${ARCH_PEER:-}" ] && echo "PARAM_PEER=$ARCH_PEER"
+    echo "SHAPE_RATE=${rate:-none}"
+    [ "${ARCH_INCLUDE_SWEEP:-1}" = 1 ] && [ -f "$STATE_DIR/sweep.result" ] &&
+      sed 's/^/SWEEP_/' "$STATE_DIR/sweep.result"
+    for k in $TUNED_KEYS; do
+      printf '%s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null)"
+    done
+    echo "# route: $(ip route show default)"
+    echo "# qdisc: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -- "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$f"
+}
+
+# archive_save [名字]  —— 存一份新的. 名字空则用日期时间.
+archive_save(){
+  archive_migrate
+  local name seq f
+  name=$(archive_sanitize "${1:-}")
+  [ -n "$name" ] || name="$(date +%m%d-%H%M)"
+  seq=$(archive_next_seq)
+  # 0000 只能由 take_snapshot 在出厂状态下创建, 不接受用户占位
+  [ "$seq" = 0000 ] && { warn "还没有出厂快照, 先跑一次 tune 或 rollback"; return 1; }
+  f=$(archive_write "$seq" "$name") || { warn "存档写入失败: $name"; return 1; }
+  ok "已存档 $seq $name"
+  info "  $f"
+}
+
+archive_list(){
+  archive_migrate
+  local f seq name created ver rate n=0 cur_cc cur_rate mark marked=0
+  [ -d "$ARCHIVE_DIR" ] || { warn "还没有任何存档"; return 0; }
+  # 判断"当前处于哪个存档": 拿现在的拥塞控制+整形值去比对
+  cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  cur_rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+  local cur_rmem; cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+  echo
+  printf '  %s %s %s %s %s\n' "$(_pad 序号 6)" "$(_pad 名字 20)" "$(_pad '时间 (UTC)' 18)" "$(_pad 整形 8)" "版本"
+  printf '  %s\n' "$(printf '─%.0s' $(seq 1 68))"
+  while IFS= read -r f; do
+    seq=$(archive_seq_of "$f"); name=$(archive_name_of "$f")
+    created=$(awk -F= '/^CREATED=/{print $2; exit}' "$f")
+    [ -n "$created" ] || created=$(awk '/^# tcpfit pre-tune snapshot/{print $NF; exit}' "$f")
+    ver=$(awk -F= '/^TCPFIT_VERSION=/{print $2; exit}' "$f")
+    rate=$(awk -F= '/^SHAPE_RATE=/{print $2; exit}' "$f")
+    case "$rate" in none|"") rate="-" ;; *) rate="${rate}M" ;; esac
+    # 当前状态标记: 整形值对得上就算(拥塞控制太粗, 多个存档可能都是 bbr)
+    # 判"当前"要三个都对上: 整形值 + 拥塞控制 + 缓冲区上限.
+    # 只看整形值不够 —— 出厂和调优后都可能是"无整形", 会标错到出厂那行.
+    mark=""
+    if [ "$marked" = 0 ]; then
+      local a_cc a_rmem
+      a_cc=$(awk -F'[ =]+' '/^net\.ipv4\.tcp_congestion_control/{print $2; exit}' "$f")
+      a_rmem=$(awk -F'[ =]+' '/^net\.core\.rmem_max/{print $2; exit}' "$f")
+      if { { [ "$rate" = "-" ] && [ -z "$cur_rate" ]; } || [ "$rate" = "${cur_rate}M" ]; } &&
+         [ "$a_cc" = "$cur_cc" ] && [ "$a_rmem" = "$cur_rmem" ]; then
+        mark=" ${green}<= 当前${plain}"; marked=1
+      fi
+    fi
+    n=$((n+1))
+    printf '  %s %s %s %s %s%s%s\n' \
+      "$(_pad "$seq" 6)" "$(_pad "$name" 20)" "$(_pad "$(fmt_created "$created")" 18)" \
+      "$(_pad "$rate" 8)" "${ver:--}" \
+      "$([ "$seq" = 0000 ] && printf ' %s' "$(_c '0;33' '(出厂, 不可改名/删除)')")" "$mark"
+  done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name '*.snap' 2>/dev/null | sort)
+  [ "$n" = 0 ] && warn "还没有任何存档"
+  echo
+  return 0
+}
+
+# 找存档: 接受序号(0/0000/1) 或名字
+# 查找顺序: 纯数字当序号, 否则当名字.
+# 所以名字取成纯数字(比如 "123")时会被当序号找, 找不到才回退 —— 别那样命名.
+# 按名字找时要处理重名: 自动名是 base-<带宽>-rtt<RTT>, 同一分钟跑两次 tune
+# 就会撞名. 早期实现返回第一个匹配(序号最小的那个), 于是"恢复我那个
+# base-220M-rtt150"会静默恢复成较旧的一份 —— 配置不一样, 用户看不出来.
+# 现在重名就列出候选并要求用序号, 宁可多问一句.
+archive_find_by_name(){
+  local want="$1" f hits=0 last=""
+  for f in "$ARCHIVE_DIR"/*.snap; do
+    [ -e "$f" ] || continue
+    [ "$(archive_name_of "$f")" = "$want" ] || continue
+    hits=$(( hits + 1 )); last="$f"
+  done
+  [ "$hits" = 0 ] && return 1
+  if [ "$hits" -gt 1 ]; then
+    warn "有 ${hits} 个存档都叫 ${want}, 请改用序号:" >&2
+    for f in "$ARCHIVE_DIR"/*.snap; do
+      [ -e "$f" ] || continue
+      [ "$(archive_name_of "$f")" = "$want" ] || continue
+      echo "    $(archive_seq_of "$f")   $want" >&2
+    done
+    return 2          # 2 = 重名, 提示已经打过, 调用方不要再说"找不到"
+  fi
+  printf '%s' "$last"; return 0
+}
+
+archive_find(){
+  local want="$1" f
+  case "$want" in
+    ''|*[!0-9]*) archive_find_by_name "$want" ;;
+    *)           f=$(archive_path "$want"); [ -n "$f" ] && { printf '%s' "$f"; return 0; }
+                 # 序号没命中, 再按名字找一遍(有人可能真把存档叫 "123")
+                 archive_find_by_name "$want" ;;
+  esac
+}
+
+# 恢复即时路由，并让 hook 只重放存档中的窗口值；网关/地址沿用启动时的路由。
+archive_restore_route(){
+  local route="$1" token skip=0 tmp
+  local -a args=() windows=()
+  rm -f "$ROUTE_HOOK" "$INITCWND_MARKER" || return 1
+  [ -n "$route" ] || return 0
+  read -r -a args <<< "$route"
+  for token in "${args[@]}"; do
+    if [ "$skip" = 1 ]; then
+      case "$token" in ''|*[!0-9]*) warn "存档中的路由窗口无效"; return 1 ;; esac
+      windows+=("$token"); skip=0
+    else
+      case "$token" in initcwnd|initrwnd) windows+=("$token"); skip=1 ;; esac
+    fi
+  done
+  [ "$skip" = 0 ] || return 1
+  ip -4 route replace "${args[@]}" 2>/dev/null || { warn "默认路由还原失败"; return 1; }
+  if [ "${#windows[@]}" -gt 0 ]; then
+    if [ ! -d "$(dirname "$ROUTE_HOOK")" ]; then
+      warn "路由已即时还原，但缺少 networkd-dispatcher hook 目录，无法持久化窗口值"
+      return 1
+    fi
+    tmp=$(mktemp "${ROUTE_HOOK}.restore.XXXXXX") || return 1
+    {
+      printf '#!/bin/bash\nwindows=('
+      printf ' %q' "${windows[@]}"
+      printf ' )\n'
+      cat <<'H'
+routes=$(ip -4 route show default)
+route=${routes%%$'\n'*}
+[ -n "$route" ] || exit 0
+read -r -a args <<< "$route"
+clean=(); skip=0
+for token in "${args[@]}"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$token" in initcwnd|initrwnd) skip=1 ;; *) clean+=("$token") ;; esac
+done
+ip -4 route replace "${clean[@]}" "${windows[@]}"
+H
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 755 "$tmp" && mv -- "$tmp" "$ROUTE_HOOK" || { rm -f "$tmp"; return 1; }
+    mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
+  fi
+  ok "默认路由已还原，窗口持久化已同步"
+}
+
+archive_restore(){
+  archive_migrate
+  local f="$1" iface rate route was_cc was_rmem was_rate now_cc now_rmem now_rate
+  local tmp k v failed=0
+  [ -r "$f" ] && [ -f "$f" ] || { warn "无法读取存档: $f"; return 1; }
+  # 出厂回滚必须移除持久化入口，与 rollback 使用同一路径。
+  if [ "$(archive_seq_of "$f")" = 0000 ]; then
+    local SNAPSHOT="$f"
+    cmd_rollback
+    return $?
+  fi
+  grep -qE '^(net|vm|fs)\.[^=]+=' "$f" || { warn "存档没有 sysctl 数据"; return 1; }
+  rate=$(awk -F= '/^SHAPE_RATE=/{print $2; exit}' "$f")
+  if [ -n "$rate" ] && [ "$rate" != none ]; then
+    is_posint "$rate" 1 100000 || { warn "存档中的整形值无效: $rate"; return 1; }
+  fi
+  iface=$(detect_iface)
+  [ -n "$iface" ] || { warn "找不到默认路由网卡"; return 1; }
+  tmp=$(mktemp "${SYSCTL_FILE}.restore.XXXXXX") || return 1
+  was_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  was_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+  was_rate=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+  info "回滚到存档 $(archive_seq_of "$f") $(archive_name_of "$f")…"
+  # 同步启动配置；本内核拒绝的值不留成启动时必然失败的配置项。
+  printf '# tcpfit restored archive %s\n' "$(archive_seq_of "$f")" > "$tmp"
+  if grep -qE '^net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr[[:space:]]*$' "$f"; then
+    modprobe tcp_bbr 2>/dev/null || true
+  fi
+  while IFS='=' read -r k v; do
+    k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
+    [ -n "$k" ] && [ -n "$v" ] || continue
+    if sysctl -qw "$k=$v" 2>/dev/null; then
+      printf '%s = %s\n' "$k" "$v" >> "$tmp" || failed=1
+    else
+      warn "参数还原失败: $k"
+      printf '# 本内核拒绝: %s = %s\n' "$k" "$v" >> "$tmp"
+      failed=1
+    fi
+  done < <(grep -E '^(net|vm|fs)\.' "$f")
+  chmod 644 "$tmp" && mv -- "$tmp" "$SYSCTL_FILE" || {
+    rm -f "$tmp"; warn "sysctl 启动配置写入失败，运行值可能已改变"; return 1;
+  }
+  [ "$failed" = 0 ] && ok "sysctl 已按存档还原并持久化"
+  if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = bbr ]; then
+    echo tcp_bbr > "$BBR_MODULE_FILE" || failed=1
+  else
+    rm -f "$BBR_MODULE_FILE" || failed=1
+  fi
+  # 路由(initcwnd)
+  route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$f")
+  archive_restore_route "$route" || failed=1
+  # 整形
+  if [ -n "$rate" ] && [ "$rate" != none ]; then
+    if cmd_shape --rate "$rate" >/dev/null 2>&1 &&
+       systemctl is-enabled tcpfit-qdisc.service >/dev/null 2>&1; then
+      ok "整形已还原为 ${rate} Mbit，开机服务已启用"
+    else warn "整形还原失败"; failed=1; fi
+  else
+    local shape_failed=0 default_kind
+    if ! systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1; then
+      # 未安装服务的干净机器无需停用；已有服务失败则必须报告。
+      if [ -f "$QDISC_UNIT" ] || [ -f "$QDISC_SCRIPT" ]; then shape_failed=1; fi
+    fi
+    rm -f "$QDISC_UNIT" "$QDISC_SCRIPT" || shape_failed=1
+    systemctl daemon-reload >/dev/null 2>&1 || shape_failed=1
+    # sysctl 已还原。删除整形后让内核补回其默认队列，不强制改成 fq。
+    if ! qdisc_remove_root "$iface"; then
+      default_kind=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+      [ -n "$default_kind" ] && [ "$(qdisc_root_kind "$iface")" = "$default_kind" ] || shape_failed=1
+    fi
+    if [ "$shape_failed" = 0 ]; then ok "整形已移除，开机整形服务已停用"
+    else warn "整形移除或服务停用失败"; failed=1; fi
+  fi
+  now_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  now_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+  echo
+  printf '  %s %s   %s\n' "$(_pad '' 12)" "$(_pad 回滚前 14)" "回滚后"
+  printf '  %s %s   %s\n' "$(_pad 拥塞控制 12)" "$(_pad "$was_cc" 14)" "$now_cc"
+  printf '  %s %s   %s\n' "$(_pad 缓冲区上限 12)" "$(_pad "$(human_bytes "$was_rmem")" 14)" "$(human_bytes "$now_rmem")"
+  now_rate=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+  printf '  %s %s   %s\n' "$(_pad 整形 12)" "$(_pad "${was_rate:-无}${was_rate:+M}" 14)" "${now_rate:-无}${now_rate:+M}"
+  echo
+  [ "$failed" = 0 ] || warn "存档仅部分还原，请检查以上失败项"
+  return "$failed"
+}
+
+archive_rename(){
+  local f="$1" new; new=$(archive_sanitize "$2")
+  [ "$(archive_seq_of "$f")" = 0000 ] && { warn "0000 ${ARCHIVE_ZERO_NAME} 是出厂状态, 不能改名"; return 1; }
+  [ -n "$new" ] || { warn "新名字不能为空"; return 1; }
+  mv "$f" "$(dirname "$f")/$(archive_seq_of "$f")-${new}.snap" && ok "已改名为 $new"
+}
+
+archive_delete(){
+  local f="$1"
+  [ "$(archive_seq_of "$f")" = 0000 ] && { warn "0000 ${ARCHIVE_ZERO_NAME} 是最后的退路, 不能删除"; return 1; }
+  rm -f "$f" && ok "已删除存档 $(archive_seq_of "$f")"
+}
+
+cmd_archive(){
+  need_root
+  take_lock
+  migrate_legacy
+  archive_migrate
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls|"")  archive_list ;;
+    save)        take_lock; archive_save "${1:-}" ;;
+    restore)     [ -n "${1:-}" ] || die "用法: $(disp) archive restore <序号|名字>"
+                 take_lock
+                 local f rc=0; f=$(archive_find "$1") || rc=$?
+                 [ "$rc" = 2 ] && return 1                       # 重名, 上面已列出候选
+                 [ -n "$f" ] || die "找不到存档: $1"
+                 archive_restore "$f" ;;
+    rename)      [ -n "${2:-}" ] || die "用法: $(disp) archive rename <序号> <新名字>"
+                 local f rc=0; f=$(archive_find "$1") || rc=$?
+                 [ "$rc" = 2 ] && return 1                       # 重名, 上面已列出候选
+                 [ -n "$f" ] || die "找不到存档: $1"
+                 archive_rename "$f" "$2" ;;
+    delete|rm)   [ -n "${1:-}" ] || die "用法: $(disp) archive delete <序号>"
+                 local f rc=0; f=$(archive_find "$1") || rc=$?
+                 [ "$rc" = 2 ] && return 1                       # 重名, 上面已列出候选
+                 [ -n "$f" ] || die "找不到存档: $1"
+                 archive_delete "$f" ;;
+    show|cat)    [ -n "${1:-}" ] || die "用法: $(disp) archive show <序号>"
+                 local f rc=0; f=$(archive_find "$1") || rc=$?
+                 [ "$rc" = 2 ] && return 1                       # 重名, 上面已列出候选
+                 [ -n "$f" ] || die "找不到存档: $1"
+                 cat "$f" ;;
+    *)           die "未知子命令: $sub（list / save / restore / rename / delete / show）" ;;
+  esac
+}
+
+cmd_uninstall(){
+  need_root
+  take_lock
+  migrate_legacy
+  local keep_archives=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-archives) keep_archives=1; shift ;;
+      --yes|-y) yes=1; shift ;;
+      *) die "未知参数: $1（--keep-archives / --yes）" ;;
+    esac
+  done
+
+  echo
+  warn "卸载会做这些事："
+  echo "    1. 回滚到出厂状态（sysctl / initcwnd / 整形全部还原）"
+  echo "    2. 删掉 $SYSCTL_FILE"
+  echo "    3. 停用并删掉 tcpfit-qdisc 服务和脚本"
+  echo "    4. 删掉 $ROUTE_HOOK（开机写回 initcwnd 的 hook）"
+  if [ "$keep_archives" = 1 ]; then
+    echo "    5. 保留 $STATE_DIR（存档和快照）"
+  else
+    echo "    5. 删掉 $STATE_DIR（存档和快照, 之后无法再回滚）"
+  fi
+  echo "    6. 删掉 $SELF_PATH 本身"
+  echo
+  echo "  不会碰: swap（要删自己 swapoff）、iperf3、ping 等装过的包."
+  echo
+  [ "$yes" = 1 ] || confirm "  确定卸载？" n || { info "已取消, 什么都没动"; return 0; }
+
+  # 这里不要再 info "回滚中…" —— cmd_rollback 自己会打, 否则屏幕上出现两遍.
+  cmd_rollback || { warn "回滚未完全成功，已停止卸载并保留存档，请处理失败项后重试"; return 1; }
+
+  # 配置和服务已由 cmd_rollback 清理并检查，不再重复执行。
+  ok "配置和服务已移除"
+
+  # 保留当前脚本到最后；旧入口清理失败时也保留存档，便于重试。
+  rm -f "$LEGACY_SELF" 2>/dev/null || { warn "旧入口删除失败: $LEGACY_SELF，已停止卸载"; return 1; }
+  if [ "$keep_archives" = 1 ]; then
+    info "存档保留在 $STATE_DIR"
+  else
+    rm -rf "$STATE_DIR" || { warn "存档目录未完全删除: $STATE_DIR，已保留当前脚本供重试"; return 1; }
+    ok "存档和快照已删除"
+  fi
+
+  # 最后删自己. 正在执行的脚本被删掉不影响当前进程(inode 还在), 但要放在最后.
+  local me="$SELF_PATH"
+  if [ -e "$me" ] || [ -L "$me" ]; then
+    rm -f "$me" || { warn "脚本删除失败: $me，卸载未完成"; return 1; }
+    ok "已删除 $me"
+  fi
+  echo
+  ok "tcpfit 已卸载. 机器回到了出厂状态."
+  echo "  重新装:  bash <(curl -fsSL $SELF_URL)"
 }
 
 cmd_rollback(){
   need_root
   take_lock
   migrate_legacy
-  local purge_swap=0
+  local purge_swap=0 failed=0 k v route
   while [ $# -gt 0 ]; do
     case "$1" in
       --purge-swap) purge_swap=1; shift ;;
@@ -721,23 +1351,50 @@ cmd_rollback(){
     esac
   done
   info "回滚中…"
-  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" /etc/modules-load.d/tcpfit-bbr.conf
-  systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1
-  rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
-  systemctl daemon-reload >/dev/null 2>&1
+  # 先取回滚前的值 —— 必须在删文件、改 sysctl 之前, 否则读到的就是回滚后的.
+  # 恢复其他存档时有这张对照表, 唯独最常用的"回到出厂"没有, 不合理.
+  local was_cc was_rmem was_rate now_cc now_rmem now_rate
+  was_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  was_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+  was_rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" "$BBR_MODULE_FILE" || {
+    warn "调优配置未完全删除，请检查文件权限或只读文件系统"; failed=1;
+  }
+  local service_stopped=1
+  if ! systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1; then
+    # 没装过整形服务时 disable 也会失败；已有服务停用失败则保留文件供重试。
+    if [ -e "$QDISC_UNIT" ] || [ -L "$QDISC_UNIT" ] || [ -e "$QDISC_SCRIPT" ] || [ -L "$QDISC_SCRIPT" ]; then
+      warn "整形服务停用失败，已保留服务文件供重试"; failed=1; service_stopped=0
+    fi
+  fi
+  if [ "$service_stopped" = 1 ]; then
+    rm -f "$QDISC_UNIT" "$QDISC_SCRIPT" || { warn "整形服务文件未完全删除"; failed=1; }
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || { warn "systemd 配置重载失败"; failed=1; }
   local iface; iface=$(detect_iface)
-  tc qdisc del dev "$iface" root 2>/dev/null
-  local gw; gw=$(detect_gw)
-  [ -n "$gw" ] && ip route replace default via "$gw" dev "$iface" 2>/dev/null
   # 逐项写回快照值
   if [ -f "$SNAPSHOT" ]; then
-    grep -E '^(net|vm|fs)\.' "$SNAPSHOT" | while IFS='=' read -r k v; do
+    while IFS='=' read -r k v; do
       k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
-      [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null
-    done
-    ok "已按快照还原 sysctl"
+      [ -n "$k" ] && [ -n "$v" ] || continue
+      if ! sysctl -qw "$k=$v" 2>/dev/null; then warn "参数还原失败: $k"; failed=1; fi
+    done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
+    [ "$failed" = 0 ] && ok "已按快照还原 sysctl"
+    route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
+    if [ -n "$route" ]; then
+      local -a route_args=()
+      read -r -a route_args <<< "$route"
+      ip -4 route replace "${route_args[@]}" 2>/dev/null || { warn "默认路由还原失败"; failed=1; }
+    fi
   else
     warn "找不到快照, 仅移除了调优文件；重启后内核默认值生效"
+    failed=1
+  fi
+  # 先还原 default_qdisc，再移除整形；内核补回的默认队列才使用出厂值。
+  if ! qdisc_remove_root "$iface"; then
+    if [ "$(qdisc_root_kind "$iface")" = htb ]; then
+      warn "整形移除失败"; failed=1
+    fi
   fi
   # swap 默认不动 —— 删掉一个正在用的 swap 可能让机器立刻 OOM.
   # 想连 swap 一起撤销要显式加 --purge-swap.
@@ -759,7 +1416,18 @@ cmd_rollback(){
   elif [ -f /swapfile ]; then
     info "/swapfile 保留. 要一并删除: $(disp) rollback --purge-swap"
   fi
-  ok "回滚完成"
+  now_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  now_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+  now_rate=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+  echo
+  printf '  %s %s   %s\n' "$(_pad '' 12)" "$(_pad 回滚前 14)" "回滚后"
+  printf '  %s %s   %s\n' "$(_pad 拥塞控制 12)" "$(_pad "$was_cc" 14)" "$now_cc"
+  printf '  %s %s   %s\n' "$(_pad 缓冲区上限 12)" "$(_pad "$(human_bytes "$was_rmem")" 14)" "$(human_bytes "$now_rmem")"
+  printf '  %s %s   %s\n' "$(_pad 整形 12)" "$(_pad "${was_rate:-无}${was_rate:+M}" 14)" "${now_rate:-无}${now_rate:+M}"
+  echo
+  if [ "$failed" = 0 ]; then ok "回滚完成"
+  else warn "仅部分回滚成功，请检查以上失败项"; fi
+  return "$failed"
 }
 
 # ── 基础调优 ────────────────────────────────────────────────────────────────
@@ -768,7 +1436,7 @@ cmd_tune(){
   take_lock
   migrate_legacy
   self_install
-  local role=mixed bw="" rtt="" no_initcwnd=0 peer=""
+  local role=mixed bw="" rtt="" no_initcwnd=0 peer="" ARCH_SAVE_NAME=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --role) role="$2"; shift 2 ;;
@@ -776,6 +1444,7 @@ cmd_tune(){
       --rtt)  rtt="$2";  shift 2 ;;
       --peer) peer="$2"; shift 2 ;;
       --no-initcwnd) no_initcwnd=1; shift ;;
+      --save) ARCH_SAVE_NAME="$2"; shift 2 ;;
       *) die "未知参数: $1" ;;
     esac
   done
@@ -822,7 +1491,7 @@ cmd_tune(){
   kv "  tcp_mem"        "$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')  (RAM 1/16, 1/8, 1/4)"
 
   modprobe tcp_bbr 2>/dev/null
-  echo tcp_bbr > /etc/modules-load.d/tcpfit-bbr.conf
+  echo tcp_bbr > "$BBR_MODULE_FILE"
   local cc=bbr
   has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr || {
     warn "kernel has no BBR, falling back to cubic (much smaller gain)"; cc=cubic; }
@@ -886,14 +1555,33 @@ fs.file-max = 1000000
 #   tcp_reordering=300 —— 现代内核走 RACK, 调高只推迟快速重传
 EOF
 
-  # 不吞错误: 内核不支持某个参数时要让用户看见, 而不是照样报"applied"
-  local serr; serr=$(sysctl -qp "$SYSCTL_FILE" 2>&1 >/dev/null)
-  if [ -n "$serr" ]; then
-    # 个别参数被内核拒绝很常见(不同内核版本支持的项不一样), 不是整体失败.
-    # 用户看到 warning 容易以为调优挂了, 措辞要说清楚.
-    warn "以下参数当前内核不支持, 已跳过, 不影响其他调优:"
-    echo "$serr" | sed 's/^/      /' >&2
-    ok "sysctl applied: $SYSCTL_FILE"
+  # 逐项校验并把内核拒绝的项注释掉.
+  #
+  # 为什么不解析 `sysctl -p` 的报错文本: 格式随 procps 版本和 locale 变
+  # （"cannot stat /proc/sys/..." / "setting key \"net.core.x\"" / 本地化过的消息），
+  # 实测非 ASCII 键名还会把正则截断. 直接试写最可靠.
+  #
+  # 为什么必须注释掉而不只是警告: 被拒的项留在文件里, systemd-sysctl.service
+  # 每次开机都会 failed（issue #9: Debian 13 / 6.12 拒绝 netdev_budget_usecs=4000）.
+  # 用户看到的是一个红色的系统服务, 而不是"某个参数没生效".
+  local _bad=0 _line _k _v _path
+  while IFS= read -r _line; do
+    case "$_line" in \#*|'') continue ;; esac
+    case "$_line" in *=*) ;; *) continue ;; esac
+    _k=$(printf '%s' "${_line%%=*}" | tr -d ' \t')
+    _v=$(printf '%s' "${_line#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$_k" ] || continue
+    _path="/proc/sys/$(printf '%s' "$_k" | tr '.' '/')"
+    if [ ! -e "$_path" ] || ! sysctl -qw "$_k=$_v" 2>/dev/null; then
+      # 用固定分隔符 | 之外的字符做 sed 分隔, 键名里不会有 %
+      sed -i "s%^[[:space:]]*${_k}[[:space:]]*=%# 本内核不支持, tcpfit 自动注释: ${_k} =%" "$SYSCTL_FILE"
+      warn "  内核不接受  ${_k} = ${_v}  —— 已在配置里注释掉"
+      _bad=$(( _bad + 1 ))
+    fi
+  done < "$SYSCTL_FILE"
+
+  if [ "$_bad" -gt 0 ]; then
+    ok "sysctl applied: $SYSCTL_FILE（$_bad 项被本内核拒绝, 已注释, 不影响其他调优）"
   else
     ok "sysctl applied: $SYSCTL_FILE"
   fi
@@ -924,8 +1612,12 @@ H
     warn "无法清除旧 initcwnd；已移除持久化 hook，当前路由请手工检查"
   fi
 
-  # 一键流程里这些收尾由 wizard 统一打印, 避免中英文交错
+  # 存一份调优后的存档. 参数一起记进去, 以后翻存档能看出当时是按什么调的.
+  ARCH_ROLE="$role"; ARCH_BW="$bw"; ARCH_RTT="$rtt"; ARCH_PEER="$peer"
+  # 向导还要扫描并决定最终整形, 存档留到全部完成之后, 避免记录中间状态.
   [ "$WIZARD" = 1 ] && return 0
+  archive_save "${ARCH_SAVE_NAME:-base-${bw}M-rtt${rtt}}" >/dev/null 2>&1 ||
+    warn "调优已生效, 但存档没建成 —— rollback 仍可用($(disp) rollback), 存档功能可稍后手动 $(disp) archive save"
 
   info "基础调优完成. 下一步跑 sweep 找限速器拐点 —— 那才是大头."
   echo "  $(disp) sweep --peer <近处的iperf3服务器> --nominal $bw"
@@ -997,11 +1689,26 @@ qdisc_root_kind(){   # qdisc_root_kind <iface>
 # 会报 "Cannot delete qdisc with handle of zero". 先把同一个 mq 换成普通句柄，
 # 再删除；其他 qdisc 仍走一次普通 del.
 qdisc_remove_root(){   # qdisc_remove_root <iface>
-  local iface="$1"
+  local iface="$1" handle
   tc qdisc del dev "$iface" root 2>/dev/null && return 0
-  [ "$(qdisc_root_kind "$iface")" = mq ] || return 1
-  tc qdisc replace dev "$iface" root handle 1: mq 2>/dev/null || return 1
-  tc qdisc del dev "$iface" root 2>/dev/null
+  # 删根失败有三种情况, 早期版本把后两种一律当失败:
+  #   a) 真失败
+  #   b) 根是 mq 且句柄为 0 —— 先给它一个真句柄才删得掉
+  #   c) 根是内核开机自动装的默认 qdisc, 句柄就是 0 ——
+  #      它【删不掉, 但能被直接覆盖】. 实测句柄 0 的根上 add / replace 都 rc=0.
+  # 把 c 当失败的代价: 一台刚开机、default_qdisc 还是 fq_codel 的机器
+  # （Ubuntu/Debian 出厂就是这样）跑 sweep 会停在
+  # "failed to enable fq for unshaped probe", 而它其实什么毛病都没有.
+  if [ "$(qdisc_root_kind "$iface")" = mq ]; then
+    tc qdisc replace dev "$iface" root handle 1: mq 2>/dev/null || return 1
+    tc qdisc del dev "$iface" root 2>/dev/null
+    return $?
+  fi
+  handle=$(tc qdisc show dev "$iface" 2>/dev/null |
+           awk '$1=="qdisc"{for(i=1;i<=NF;i++) if($i=="root"){print $3; exit}}')
+  # 句柄 0 = 内核自己装的, 没什么可删, 交给调用方覆盖
+  [ "$handle" = "0:" ] && return 0
+  return 1
 }
 
 qdisc_set_mq_leaves(){   # qdisc_set_mq_leaves <iface> <kind>
@@ -1089,16 +1796,30 @@ write_qdisc(){
   local rate="$1" iface="$2"
   cat > "$QDISC_SCRIPT" <<EOF
 #!/bin/bash
-IF=${iface}
+# 网卡名动态探测. 写死的话, 服务商换宿主/换槽位导致网卡改名之后
+# 脚本就一直 "Cannot find device" —— 用户只看到服务 failed, 看不出原因.
+# 探测不到才回退到生成时的名字.
+IF=\$(ip -o -4 route show default 2>/dev/null | awk '{print \$5; exit}')
+[ -n "\$IF" ] || IF=${iface}
 RATE=\${1:-${rate}}
 BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
-tc qdisc del dev \$IF root 2>/dev/null || {
-  tc qdisc replace dev \$IF root handle 1: mq 2>/dev/null || exit 1
-  tc qdisc del dev \$IF root 2>/dev/null || exit 1
-}
-tc qdisc add dev \$IF root handle 1: htb default 10 || exit 1
-tc class add dev \$IF parent 1: classid 1:10 htb rate \${RATE}mbit ceil \${RATE}mbit burst \${BURST} cburst \${BURST} quantum 1514 || exit 1
-tc qdisc add dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate \${RATE}mbit || exit 1
+# 删根失败有两种可能, 早期版本把它们混为一谈:
+#   a) 本来就没有可删的根（开机时最常见, 内核补回的默认 qdisc 句柄是 0）
+#   b) 根是 mq 且句柄为 0 —— 要先给它一个真句柄才删得掉
+# 无脑走 (b) 的话, 单队列网卡上 \`tc qdisc replace ... root mq\` 会报
+# "RTNETLINK answers: Operation not supported" 然后 exit 1,
+# 于是 tcpfit-qdisc.service 每次开机都失败, 整形静默丢失（issue #7）.
+if ! tc qdisc del dev \$IF root 2>/dev/null; then
+  case "\$(tc qdisc show dev \$IF 2>/dev/null | head -1)" in
+    *" mq "*) tc qdisc replace dev \$IF root handle 1: mq 2>/dev/null &&
+              tc qdisc del dev \$IF root 2>/dev/null ;;
+  esac
+fi
+# 一律用 replace 而不是 add —— add 在已有同句柄 qdisc 时报 "File exists",
+# 让重复执行(手动重跑 / systemd 重启单元)变成失败.
+tc qdisc replace dev \$IF root handle 1: htb default 10 || exit 1
+tc class replace dev \$IF parent 1: classid 1:10 htb rate \${RATE}mbit ceil \${RATE}mbit burst \${BURST} cburst \${BURST} quantum 1514 || exit 1
+tc qdisc replace dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate \${RATE}mbit || exit 1
 EOF
   chmod +x "$QDISC_SCRIPT"
   cat > "$QDISC_UNIT" <<EOF
@@ -1394,8 +2115,12 @@ cmd_sweep(){
   take_lock
   command -v iperf3 >/dev/null || die "需要 iperf3: apt install -y iperf3 / yum install -y iperf3"
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
-  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=2500
+  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=10000
   local PRE_SCAN_GAP=15 BASELINE_CAP=0.5
+  # cap 和 AGG_MIN 是两件事, 早期版本共用一个值, 抬 cap 会连带改掉"多大算大机器":
+  #   cap     —— 愿意扫到多高（--cap 可调）
+  #   AGG_MIN —— 单流不可信、要用 8 流复核的带宽门槛（跟 cap 无关）
+  local AGG_MIN=2500
   while [ $# -gt 0 ]; do
     case "$1" in
       --peer) peer="$2"; shift 2 ;;
@@ -1449,7 +2174,7 @@ cmd_sweep(){
   trap 'echo; warn "interrupted, restoring qdisc..."; qdisc_restore; exit 130' INT TERM HUP   # 中断退出是对的
 
   # 扫一段区间. 结果放进全局 LAST_OK(最后一个干净档) 与 BROKE_AT(重传跳变的那档)
-  LAST_OK=""; BROKE_AT=""; SLOW_HITS=0; PEER_TOO_SLOW=0; BASE_LOSS=""; SPIKE_MIN_LOSS=""
+  LAST_OK=""; BROKE_AT=""; SLOW_HITS=0; PEER_TOO_SLOW=0; BASE_LOSS=""; SPIKE_MIN_LOSS=""; SLOW_AT=""
   # 跳变判定: 既要超过绝对阈值, 也要明显高于本底. 远程对端可能有
   # 0.1%-0.3% 的稳定底噪, 所以用 5 倍本底; 同时把相对阈值封顶在 1%,
   # 避免底噪把实测 1.35% 以上的 policer 拐点完全遮住.
@@ -1531,7 +2256,7 @@ cmd_sweep(){
         SLOW_HITS=$(( SLOW_HITS + 1 ))
         printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" \
           "$(_c '0;33' "only $(awk -v g="$gp" -v r="$r" 'BEGIN{printf "%d", g*100/r}')% of target")"
-        [ "$SLOW_HITS" -ge 3 ] && { PEER_TOO_SLOW=1; return 0; }
+        [ "$SLOW_HITS" -ge 3 ] && { PEER_TOO_SLOW=1; SLOW_AT="$r"; return 0; }
         LAST_OK=$r; prev_gp=$gp; sleep "$GAP"; continue
       fi
       SLOW_HITS=0
@@ -1568,8 +2293,8 @@ cmd_sweep(){
     # receiver 可能只剩自动探测值的一小部分, 直接拿它推扫描区间会把 40M
     # 机器误扫成 14M、最终持久限到 12M. 只在低于 70% 时补两次, 正常机器
     # 不增加时长；三次取 receiver 最高的【整组】结果, sender/重传必须同步换.
-    # 超过扫描 cap 的大带宽机沿用后面的 8 流保护, 不在这里重复增加两轮单流.
-    if [ -n "$nominal" ] && [ "$nominal" -le "$cap" ] 2>/dev/null && awk -v g="$cap_gp" -v n="$nominal" \
+    # 大带宽机（>=AGG_MIN）沿用后面的 8 流保护, 不在这里重复增加两轮单流.
+    if [ -n "$nominal" ] && [ "$nominal" -lt "$AGG_MIN" ] 2>/dev/null && awk -v g="$cap_gp" -v n="$nominal" \
        'BEGIN{exit !(g < n*0.7)}'; then
       local best_res="$ures" best_gp="$cap_gp" samples=1 sample_n extra
       local es er egp ert elp
@@ -1603,9 +2328,9 @@ cmd_sweep(){
 
     # 大带宽机不能只凭单流决定是否进入扫描. 长 RTT / 对端接收窗口会把 10G
     # 机器的单流压到 2.5G 以下; 如果这条单流又恰好有路径丢包, 旧逻辑会把
-    # 它误认成低速 policer 并扫描几百兆区间. 只在用户标称值已经超过 cap、
+    # 它误认成低速 policer 并扫描几百兆区间. 只在用户标称值已达到 AGG_MIN、
     # 且单流结果确实可疑时补一次 8 流确认，不给普通低带宽扫描增加流量.
-    if [ -n "$nominal" ] && [ "$nominal" -gt "$cap" ] 2>/dev/null && \
+    if [ -n "$nominal" ] && [ "$nominal" -ge "$AGG_MIN" ] 2>/dev/null && \
        awk -v g="$cap_gp" -v c="$cap" -v l="$ulp" -v t="$thresh" \
          'BEGIN{exit !(g <= c && l > t)}'; then
       local ares="" ag art ar alp
@@ -1634,7 +2359,8 @@ cmd_sweep(){
         printf '  %-10s %12s %9s %8s  %s\n' "none" "$cap_gp" "$urt" "$ulp" "above cap"
       echo
       warn "不限速 ${cap_streams} 流能送达 ${cap_gp} Mbps, 超过 ${cap} Mbit 的扫描上限."
-      echo "  本工具主要面向国内优化线路, 这个带宽下整形基本不会触发."
+      echo "  这个量级基本只有专线和内网, 限速器很少见."
+      echo "  确定要扫的话: tcpfit sweep --peer <对端> --cap <更大的值>"
       mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nABOVE_CAP=%s\nUNSHAPED=%s\n' "$cap" "$cap_gp" > "$STATE_DIR/sweep.result"
       traffic_report
       return 3
@@ -1733,12 +2459,28 @@ cmd_sweep(){
     restore_qdisc
     [ "$WIZARD" = 1 ] && printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
     echo
-    warn "对端速率不够, 无法测出本机限速器 —— 已暂停调优."
-    echo
-    echo "  怎么办："
-    echo "    1) 换一个更快的对端. 对端带宽必须明显高于本机（${nominal}Mbps）"
-    echo "    2) 直接用公共节点（选对端时回车）, Leaseweb 机房带宽足够"
-    echo "    3) 如果确定本机带宽没那么高, 重跑时把带宽填成实际值"
+    # 连续三档达不到限速值, 原因有两种, 早期版本一律报"对端太慢".
+    # 扫描上限还是 2500 时这个错标很少露面; 抬到 10000 之后大机器会经常走到这里,
+    # 被指使去换对端, 换完还是一样 —— 因为瓶颈根本在本机.
+    # 判据: 掉速发生在【不限速实测吞吐】之上, 说明这速率本机本来就跑不到.
+    # 实测依据: 1 核机器在 3000 Mbit 档 HTB 只能送达 71.5%, 而判据线是 70%.
+    if [ -n "$cap_gp" ] && [ -n "$SLOW_AT" ] && \
+       awk -v s="$SLOW_AT" -v g="$cap_gp" 'BEGIN{exit !(g > 0 && s > g*1.1)}' 2>/dev/null; then
+      warn "扫到 ${SLOW_AT} Mbit 时连续达不到目标 —— 这台机器跑不到这个速率."
+      echo
+      echo "  不限速实测 ${cap_gp} Mbps, 而扫描已经走到 ${SLOW_AT} Mbit."
+      echo "  可能的原因："
+      echo "    1) 这条线没有限速器, 到 ${cap_gp} 就到顶了 —— 那本来就不需要整形"
+      echo "    2) CPU 推不动这个速率的 HTB（核少的机器 3Gbit 以上会明显掉速）"
+      echo "    3) 对端不够快, 换公共节点（选对端时回车）再试一次"
+    else
+      warn "对端速率不够, 无法测出本机限速器 —— 已暂停调优."
+      echo
+      echo "  怎么办："
+      echo "    1) 换一个更快的对端. 对端带宽必须明显高于本机（${nominal}Mbps）"
+      echo "    2) 直接用公共节点（选对端时回车）, Leaseweb 机房带宽足够"
+      echo "    3) 如果确定本机带宽没那么高, 重跑时把带宽填成实际值"
+    fi
     echo
     info "基础调优（拥塞控制 / 缓冲区）已生效."
     traffic_report
@@ -2040,6 +2782,12 @@ auto_pick_peer(){
   # 兜底: 命令行直接跑 sweep/verify 的人不走向导, 拿不到那边的安装提示.
   # 没有 ping 时下面每个节点都取不到 RTT, sorted 为空 → 静默 return 1,
   # 调用方报 "公共测速服务器暂时都不可用" —— 服务器是无辜的, 得说真话.
+  if command -v ping >/dev/null 2>&1 && ! ping_supports_4; then
+    warn "本机的 ping 不认 -4（多半是 GNU inetutils 版）, 无法自动选择对端." >&2
+    warn "  换成标准版:  apt install -y iputils-ping  /  dnf install -y iputils" >&2
+    warn "  或指定对端:  --peer <iperf3服务器>" >&2
+    echo ""; return 1
+  fi
   if ! command -v ping >/dev/null 2>&1; then
     warn "本机缺少 ping, 无法自动选择对端." >&2
     warn "  安装:  apt install -y iputils-ping   /   dnf install -y iputils" >&2
@@ -2065,11 +2813,12 @@ auto_pick_peer(){
   # 早期只有一个 60ms 硬阈值, 结果香港机器上新加坡 61ms 被卡掉、整个流程失败 —— 太死板.
   local ideal="${NETTUNE_PEER_IDEAL_RTT:-50}"
   local accept="${NETTUNE_PEER_MAX_RTT:-100}"
-  local fallback="" fallback_rtt=""
+  local fallback="" fallback_rtt="" limit="$accept" FAR_SKIPPED=0
   while read -r rtt cand name prov; do
     [ -z "$cand" ] && continue
-    if [ "$rtt" -gt "$accept" ] 2>/dev/null; then
+    if [ "$rtt" -gt "$limit" ] 2>/dev/null; then
       printf '  %-34s %-10s %-10s RTT %-6s %s\n' "$cand" "$name" "$prov" "${rtt}ms" "too far, skipped" >&2
+      FAR_SKIPPED=1
       continue
     fi
     printf '  %-34s %-10s %-10s RTT %-6s ' "$cand" "$name" "$prov" "${rtt}ms" >&2
@@ -2114,8 +2863,43 @@ auto_pick_peer(){
     warn "结果仍然可用, 只是可能没榨到极限." >&2
   fi
 
+  # 全部节点都超过 accept 时, 早期版本直接失败 —— 国内机器上 18 个节点无一幸免,
+  # 整个流程走不下去（issue #4）. 但"远"只是让拐点偏保守, 不是测不了.
+  # 所以改成: 说清楚代价, 然后放开距离限制再扫一遍.
+  if [ -z "$best" ] && [ -z "$fallback" ] && [ "$FAR_SKIPPED" = 1 ]; then
+    echo >&2
+    warn "所有公共节点都超过 ${accept}ms —— 本机多半在国内, 或线路绕远." >&2
+    warn "距离远会让链路本身的丢包混进测量, 扫出的拐点偏保守（宁可低不冒高）." >&2
+    warn "结果仍然可用. 想更准就自己在近处开一台 iperf3 -s, 用 --peer 指定." >&2
+    echo >&2
+    info "放开距离限制, 用最近的节点重新试…" >&2
+    limit=100000
+    while read -r rtt cand name prov; do
+      [ -z "$cand" ] && continue
+      printf '  %-34s %-10s %-10s RTT %-6s ' "$cand" "$name" "$prov" "${rtt}ms" >&2
+      if ! probe_peer_port "$cand"; then
+        echo "port closed (tried $PROBE_PORTS)" >&2; continue
+      fi
+      local pport2="$PROBE_PORT_OK"
+      if ! command -v iperf3 >/dev/null 2>&1; then
+        printf '%s\n' "$(_c '0;32' "reachable (port $pport2)")" >&2
+        echo "$cand:$pport2"; return 0
+      fi
+      local gp2="" try2
+      for try2 in $(port_order "$pport2"); do
+        if timeout $TIMEOUT_FG 25 iperf3 $IP_FAMILY -c "$cand" -p "$try2" -t 3 -P 1 >/dev/null 2>&1; then gp2="$try2"; break; fi
+      done
+      if [ -n "$gp2" ]; then
+        echo "$(_c '0;33' "available (port $gp2, 距离超标但可用)")" >&2
+        best="$cand:$gp2"; break
+      fi
+      echo "all $(echo $PORT_POOL | wc -w) ports busy" >&2
+      sleep 2
+    done <<< "$(echo "$sorted" | sort -n | head -5)"
+  fi
+
   if [ -z "$best" ]; then
-    warn "没找到 ${accept}ms 以内且空闲的公共测速服务器." >&2
+    warn "公共测速服务器都不可用（要么端口不通, 要么全部占线）." >&2
     warn "公共服务器一次只接一个测试, 等几分钟再试通常就有了." >&2
     warn "或者自己开一台近处的机器跑 iperf3 -s, 然后用 --peer 指定." >&2
     return 1
@@ -2169,7 +2953,10 @@ drain_tty(){ while read -rsn1 -t 0.05 2>/dev/null </dev/tty; do :; done; return 
 ask(){  # ask "问题" "默认值"  -> 回显用户输入或默认值
   local q="$1" d="${2:-}" a
   if [ -n "$d" ]; then printf '%s [%s]: ' "$q" "$d" >&2; else printf '%s: ' "$q" >&2; fi
-  read -r a </dev/tty || a=""
+  # 2>/dev/null 必须写在 </dev/tty 前面（重定向从左往右生效）——
+  # 否则无 tty 时（管道调用、CI、ssh host tcpfit < /dev/null）
+  # 每问一次就往屏幕漏一行 "/dev/tty: No such device or address".
+  read -r a 2>/dev/null </dev/tty || a=""
   echo "${a:-$d}"
 }
 
@@ -2216,6 +3003,8 @@ banner(){
   _row "$(printf '  tcpfit - VPS TCP Optimization%s ' "$(_rpad "v$VERSION" 23)")" '0;32'
   _row "  本脚本由 kylin010 编写和维护"
   _row "  github.com/Kylin010/tcpfit"
+  _row "  VPS 补货频道  t.me/vpskuaibu"
+  _row "  VPS 测评数据  spacevps.cc"
   _sep
   _row "  0. Exit"
   _item 1 "一键调优" "Auto-tune (recommended)"   "~10 min"
@@ -2227,17 +3016,22 @@ banner(){
   _item 6 "端口验证" "Verify port capability"    "~1 min"
   _item 7 "回滚改动" "Rollback all changes"
   _item 8 "检查更新" "Check for updates"
+  _item 9 "调优存档" "Tuning archives"
+  _row "  u. 卸载 tcpfit / Uninstall"
   _bot
   printf "  %-9s %s core / %s MB / %s\n" "Machine" "$cores" "$ram" "$(uname -r)"
   printf "  %-9s cc=%s  shaper=%s  " "Network" "${cc:-?}" "${shaper:-none}"
   [ "$tuned" = Tuned ] && printf "${green}%s${plain}\n" "$tuned" || printf "${yellow}%s${plain}\n" "$tuned"
+  local _stats; _stats=$(telemetry_line)
+  [ -n "$_stats" ] && printf "  %-9s %s\n" "Runs" "$_stats"
 }
 
 # 一键全自动.
 # 设计原则：所有要用户回答的东西集中在最前面（3 个问题）, 确认之后一路跑到底不再打断；
 # 执行阶段的日志用英文（都是参数名和数值, 中英混排反而看不清）, 结论用中文.
 wizard(){
-  WIZARD=1
+  local WIZARD=1 ARCH_INCLUDE_SWEEP=0
+  local ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
   local ram; ram=$(detect_ram_mb)
   echo
   echo "  ── 一键调优 ──"
@@ -2294,14 +3088,21 @@ wizard(){
     echo "  确认带宽之前, tcpfit 需要安装 iperf3 才可以正常运行."
     echo
     if confirm "  安装？" y; then
-      echo "    ────────────────────────────────────────"
-      if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y iperf3
-      elif command -v dnf     >/dev/null; then dnf install -y iperf3
-      elif command -v yum     >/dev/null; then yum install -y epel-release; yum install -y iperf3
-      # Alpine 的 busybox timeout/pkill 功能不全, 一并装 GNU 版
-      elif command -v apk     >/dev/null; then apk add iperf3 coreutils procps
-      else warn "认不出包管理器, 请手动安装 iperf3"; fi
-      echo "    ────────────────────────────────────────"
+      # 装之前先看锁, 被占的话直接说清楚, 别让用户干等一轮 apt 超时
+      local _holder; _holder=$(apt_lock_holder)
+      if [ -n "$_holder" ]; then
+        set -- $_holder
+        warn "包管理器正被 PID $1（$2, 已运行 $3）占用, 先不装了."
+      else
+        echo "    ────────────────────────────────────────"
+        if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y iperf3
+        elif command -v dnf     >/dev/null; then dnf install -y iperf3
+        elif command -v yum     >/dev/null; then yum install -y epel-release; yum install -y iperf3
+        # Alpine 的 busybox timeout/pkill 功能不全, 一并装 GNU 版
+        elif command -v apk     >/dev/null; then apk add iperf3 coreutils procps
+        else warn "认不出包管理器, 请手动安装 iperf3"; fi
+        echo "    ────────────────────────────────────────"
+      fi
     fi
     if command -v iperf3 >/dev/null 2>&1; then
       ok "iperf3 $(iperf3 --version 2>/dev/null | awk 'NR==1{print $2}') 已就绪"
@@ -2309,10 +3110,11 @@ wizard(){
       # 不中止 —— 基础调优(BBR/缓冲区/起步)完全不依赖 iperf3, 那也是收益最大的一部分.
       # 少掉的是: 实测带宽、扫拐点、验证吞吐.
       HAVE_IPERF3=0; QN=2
-      echo
-      warn "没有 iperf3, 只能做基础调优:"
+      explain_pkg_failure
+      warn "所以这次只能做基础调优:"
       warn "  不能实测带宽(要你手填)、不能扫限速器拐点、不能验证吞吐."
       warn "  基础调优本身照做, 那是收益最大的一部分."
+      warn "  装上 iperf3 之后重跑一次 $(disp), 就能补上剩下的."
     fi
   fi
 
@@ -2321,6 +3123,12 @@ wizard(){
   # "iperf3 已经安装" 那一支, 永远问不到 ping.
   # 缺 ping 的后果: auto_pick_peer 靠它给 18 个节点排延迟, 全拿不到就返回空,
   # 向导最后报 "公共测速服务器暂时都不可用" —— 那句在甩锅给无辜的对端.
+  # ping 存在【不代表能用】: GNU inetutils 版不认 -4, 会让自动选对端全军覆没.
+  # 这个分支必须在"没有 ping"之前判不了(没装时 ping_variant 返回 none),
+  # 所以放在后面, 等 ping 确实存在时再看它是哪一种.
+  if [ "$HAVE_IPERF3" = 1 ] && command -v ping >/dev/null 2>&1; then
+    check_ping_variant || true
+  fi
   if [ "$HAVE_IPERF3" = 1 ] && ! command -v ping >/dev/null 2>&1; then
     echo
     echo "  自动挑选测速对端需要 ping, 本机没有."
@@ -2515,6 +3323,7 @@ wizard(){
   else
     cmd_tune --role "$role" --bw "$bw" || die "base tuning failed"
   fi
+  ARCH_PEER="$peer"
 
   # 这四个必须在所有分支之前声明. set -u 下, 只要有一条路径没赋值,
   # 结尾传给 wizard_result 时就是 unbound variable —— v0.3.8 的"未检测到限速器"
@@ -2535,6 +3344,7 @@ wizard(){
     fi
     printf '\n  %s[3/3] Verify%s\n' "$bold" "$plain"
     command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
+    wizard_archive
     wizard_result "$bw" "$rate" "$knee" "$margin" "$ram"
     return 0
   fi
@@ -2560,6 +3370,7 @@ wizard(){
 
   local out_of_range="" above_cap=""
   if { [ "$sweep_rc" = 0 ] || [ "$sweep_rc" = 3 ]; } && [ -f "$STATE_DIR/sweep.result" ]; then
+    ARCH_INCLUDE_SWEEP=1
     no_knee=$(awk -F= '/^NO_KNEE/{print $2}' "$STATE_DIR/sweep.result")
     out_of_range=$(awk -F= '/^OUT_OF_RANGE/{print $2}' "$STATE_DIR/sweep.result")
     above_cap=$(awk -F= '/^ABOVE_CAP/{print $2}' "$STATE_DIR/sweep.result")
@@ -2608,7 +3419,15 @@ wizard(){
   fi
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
 
+  wizard_archive
   wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$above_cap"
+}
+
+# 两条向导路径都在最终整形和验证后保存; archive_write 从机器读取实际状态.
+# 未扫描或扫描失败时 ARCH_INCLUDE_SWEEP=0, 不把旧扫描写成本轮结果.
+wizard_archive(){
+  archive_save "wizard-${ARCH_BW}M-rtt${ARCH_RTT}" >/dev/null 2>&1 ||
+    warn "调优已生效, 但存档没建成 —— rollback 仍可用($(disp) rollback), 存档功能可稍后手动 $(disp) archive save"
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
@@ -2673,6 +3492,13 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
   fi
   echo
   ok "调优完成."
+  echo
+  echo "  ─────────────────────────────────────────────"
+  echo "    菲比VPS补货频道：        t.me/vpskuaibu"
+  echo "    星空VPS（免费API查阅机型）： spacevps.cc"
+  echo "    问题反馈：               github.com/Kylin010/tcpfit/issues"
+  echo "    合作：                   4496540pva@gmail.com"
+  echo
 }
 
 menu_loop(){
@@ -2680,10 +3506,11 @@ menu_loop(){
   take_lock
   migrate_legacy
   self_install
+  telemetry_ping
   while true; do
     banner
     echo
-    local c; c=$(ask "  请选择 / Select [0-8]" "1")
+    local c; c=$(ask "  请选择 / Select [0-9,u]" "1")
     echo
     case "$c" in
       1) wizard
@@ -2723,19 +3550,31 @@ menu_loop(){
       6) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
       7) confirm "  确定回滚全部改动？" && cmd_rollback ;;
       8) cmd_update --from-menu ;;
+      9) echo; archive_list; echo
+         local a; a=$(ask "  回滚到哪个存档？(序号, 回车跳过)" "")
+         if [ -n "$a" ]; then
+           local f
+           if f=$(archive_find "$a"); then
+             confirm "  确定回滚到 $(archive_seq_of "$f") $(archive_name_of "$f")？" && archive_restore "$f"
+           else
+             local find_rc=$?
+             [ "$find_rc" = 2 ] || warn "找不到存档: $a"
+           fi
+         fi ;;
+      u|U) cmd_uninstall; exit $? ;;
       0) exit 0 ;;
       *) warn "Invalid selection" ;;
     esac
     echo
     drain_tty
     printf "  ${yellow}按任意键返回${plain}"
-    read -rsn1 </dev/tty 2>/dev/null || read -r </dev/tty 2>/dev/null || true
+    read -rsn1 2>/dev/null </dev/tty || read -r 2>/dev/null </dev/tty || true
     echo
   done
 }
 
 # ── 入口 ────────────────────────────────────────────────────────────────────
-usage(){ sed -n '2,20p' "$0" | sed 's/^# \?//'; }
+usage(){ awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
 case "${1:-}" in
   detect)   shift; cmd_detect "$@" ;;
@@ -2747,6 +3586,8 @@ case "${1:-}" in
   verify)   shift; cmd_verify "$@" ;;
   status)   shift; cmd_status "$@" ;;
   rollback) shift; cmd_rollback "$@" ;;
+  archive|archives|snap) shift; cmd_archive "$@" ;;
+  uninstall|remove) shift; cmd_uninstall "$@" ;;
   update)   shift; cmd_update "$@" ;;
   version)  echo "tcpfit $VERSION" ;;
   menu)     shift; menu_loop ;;
