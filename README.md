@@ -56,6 +56,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 tcpfit detect                                     # 机器画像
 tcpfit probe    --peer <近处iperf3服务器>          # 探测可用带宽
 tcpfit tune     --role proxy --bw 500             # 基础调优
+tcpfit tune     --role proxy --bw 500 --save 换机房前   # 调优并给存档命名
 tcpfit sweep    --peer <近处iperf3服务器> --nominal 500
 tcpfit shape    --rate 510                        # 应用整形
 tcpfit shape    --off                             # 移除整形, 保留基础调优
@@ -68,9 +69,24 @@ tcpfit archive list                               # 列出存档
 tcpfit archive save "晚间配置"                     # 保存当前状态
 tcpfit archive restore 0010                       # 恢复第 10 份存档
 tcpfit archive rename 0010 "备用配置"              # 存档改名
-tcpfit archive delete 0010                        # 删除指定存档
+tcpfit archive show   0010                        # 查看某份存档的内容
+tcpfit archive delete 0010                        # 删除指定存档（别名 rm）
 tcpfit uninstall --keep-archives                  # 卸载，保留存档和快照
 ```
+
+## PPPoE / 拨号线路
+
+家宽 PPPoE、以及任何默认路由长这样的机器：
+
+```
+default dev ppp0 scope link          # 点对点, 没有 via
+```
+
+0.5.8 起支持. 这类机器每次重拨都是新接口, qdisc 和路由窗口会跟着消失,
+所以 tcpfit 会往 `/etc/ppp/ip-up.d/50-tcpfit` 放一个钩子, 让整形和 initcwnd
+在拨通后自动回来. 钩子只对调优时那块网卡生效, 不会碰机器上别的 ppp 链路.
+
+没有 `/etc/ppp/ip-up.d` 的机器不受影响, 不会被创建任何东西.
 
 ## 多机（未上线）
 

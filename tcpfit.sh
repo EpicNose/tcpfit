@@ -31,12 +31,16 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.7"
+VERSION="0.5.8"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
 QDISC_UNIT="/etc/systemd/system/tcpfit-qdisc.service"
 ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd"
+# PPPoE/PPP 每次拨通都是新接口, qdisc 和路由窗口跟着消失. 而
+# tcpfit-qdisc.service 是 oneshot 只在开机跑一次, networkd-dispatcher
+# 又管不到 pppd 拉起的接口 —— 这类机器必须挂 pppd 自己的钩子.
+PPP_HOOK="/etc/ppp/ip-up.d/50-tcpfit"
 BBR_MODULE_FILE="/etc/modules-load.d/tcpfit-bbr.conf"
 INITCWND_MARKER="$STATE_DIR/initcwnd.owned"
 SNAPSHOT="$STATE_DIR/pre-tune.snapshot"
@@ -403,17 +407,57 @@ migrate_legacy(){
 # 选 v4 还是 v6 测速都是它. 只是纯 v6 机器的 v4 路由表是空的, 所以 v4 查不到时回退查 v6.
 # (`ip route` 等价于 `ip -4 route`, 早期版本只写这一句, 纯 v6 机器直接
 #  die "找不到默认路由网卡", 从来就没跑起来过.)
+# 从默认路由里按【关键字】取字段, 绝不能按位置数.
+#   default via 10.0.0.1 dev eth0 proto dhcp   -> $5 = eth0   碰巧对
+#   default dev ppp0 scope link                -> $5 = link   错
+# 点对点链路(PPPoE / PPP / 部分静态路由)的默认路由没有 `via <IP>` 这两个词,
+# 整行左移两位. 实测客户的 HKT PPPoE 机器: detect_iface 返回 "link",
+# 于是 qdisc / 整形 / MTU / 扫描全部作用在一个不存在的网卡上, 工具整体不可用.
+# 触发条件是「默认路由没有 via」, 不限 PPPoE —— 静态点对点路由同样会中.
+route_field(){   # route_field <关键字> [路由行]
+  local key="$1" line="${2-}"
+  [ $# -ge 2 ] || line=$(ip -4 route show default 2>/dev/null | head -1)
+  printf '%s\n' "$line" | awk -v k="$key" '{
+    for(i=1;i<NF;i++) if($i==k){print $(i+1); exit}}'
+}
+
+# 设 initcwnd 必须【沿用现有默认路由的全部 token】, 只替换窗口字段.
+# 自己拼 `via $gw dev $if` 有两个问题: 丢掉 scope/metric/proto/onlink 等
+# 服务商下发的属性; 点对点路由压根没有 via, 拼不出来 —— 早期版本因此
+# 整块跳过 initcwnd, PPPoE 机器一直拿不到.
+route_set_initcwnd(){   # route_set_initcwnd <值>
+  local n="$1" route token skip=0
+  local -a args=() clean=()
+  route=$(ip -4 route show default 2>/dev/null | head -1)
+  [ -n "$route" ] || return 1
+  # 多路径路由长这样, 第一行既没有 dev 也没有 via:
+  #   default proto static
+  #       nexthop via 10.1.1.1 dev v1 weight 1
+  #       nexthop via 10.2.2.1 dev v2 weight 1
+  # 拿第一行去 replace 会试图把整条多路径换成一条无出口的路由.
+  # 内核会拒(No such device, 实测), 但别指望内核兜底 —— 自己先认出来.
+  [ -n "$(route_field dev "$route")" ] || return 1
+  read -r -a args <<< "$route"
+  for token in "${args[@]}"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$token" in initcwnd|initrwnd) skip=1 ;; *) clean+=("$token") ;; esac
+  done
+  [ "${#clean[@]}" -gt 1 ] || return 1
+  ip -4 route replace "${clean[@]}" initcwnd "$n" initrwnd "$n" 2>/dev/null
+}
+
 detect_iface(){
   local i
-  i=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
-  [ -n "$i" ] || i=$(ip -6 route show default 2>/dev/null | awk '{print $5; exit}')
+  i=$(route_field dev)
+  [ -n "$i" ] || i=$(route_field dev "$(ip -6 route show default 2>/dev/null | head -1)")
   echo "$i"
 }
 # 网关【只取 v4】. 它唯一的用途是 `ip route replace default via $gw ...`(设 initcwnd),
 # 那是 IPv4 路由表操作, 喂 v6 地址进去会直接报
 # "Error: inet address is expected rather than 2a0f:...". 实测验证过.
 # 纯 v6 机器上这里返回空, 调用方的 [ -n "$gw" ] 会跳过 initcwnd —— 安全降级.
-detect_gw(){    ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
+# 点对点链路没有网关, 这里返回空 —— 调用方必须能处理"无网关"而不是当失败.
+detect_gw(){    route_field via; }
 
 # 只清理 tcpfit 自己写入的 initcwnd/initrwnd. 旧版本没有 ownership marker,
 # 所以兼容两种证据: tcpfit 的持久化 hook, 或快照明确显示调优前没有这两个属性.
@@ -440,7 +484,7 @@ clear_owned_initcwnd(){
   INITCWND_CLEARED=1
 
   # 先移除持久化入口；即使运行时路由暂时改不了，重连/重启后也不会再写回 32.
-  rm -f "$ROUTE_HOOK" "$INITCWND_MARKER"
+  rm -f "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER"
   if ! has_str "$route" ' initcwnd ' && ! has_str "$route" ' initrwnd '; then
     return 0
   fi
@@ -1108,7 +1152,7 @@ archive_find(){
 archive_restore_route(){
   local route="$1" token skip=0 tmp
   local -a args=() windows=()
-  rm -f "$ROUTE_HOOK" "$INITCWND_MARKER" || return 1
+  rm -f "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER" || return 1
   [ -n "$route" ] || return 0
   read -r -a args <<< "$route"
   for token in "${args[@]}"; do
@@ -1122,8 +1166,18 @@ archive_restore_route(){
   [ "$skip" = 0 ] || return 1
   ip -4 route replace "${args[@]}" 2>/dev/null || { warn "默认路由还原失败"; return 1; }
   if [ "${#windows[@]}" -gt 0 ]; then
+    # 两条持久化路径, 有一条能用就算成功.
+    # 早期只认 networkd-dispatcher, 于是 PPPoE 机器（多半没装它）恢复
+    # 任何带 initcwnd 的存档都直接失败, 而且先把 ppp 钩子删掉了.
+    local persisted=0
+    write_ppp_hook "$(route_field dev "$route")" "${windows[@]}" && persisted=1
     if [ ! -d "$(dirname "$ROUTE_HOOK")" ]; then
-      warn "路由已即时还原，但缺少 networkd-dispatcher hook 目录，无法持久化窗口值"
+      if [ "$persisted" = 1 ]; then
+        mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
+        ok "默认路由已还原，窗口持久化交给 pppd 的 ip-up 钩子"
+        return 0
+      fi
+      warn "路由已即时还原，但这台机器既无 networkd-dispatcher 也无 /etc/ppp/ip-up.d，窗口值无法持久化"
       return 1
     fi
     tmp=$(mktemp "${ROUTE_HOOK}.restore.XXXXXX") || return 1
@@ -1357,7 +1411,7 @@ cmd_rollback(){
   was_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   was_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
   was_rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
-  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" "$BBR_MODULE_FILE" || {
+  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER" "$BBR_MODULE_FILE" || {
     warn "调优配置未完全删除，请检查文件权限或只读文件系统"; failed=1;
   }
   local service_stopped=1
@@ -1587,24 +1641,28 @@ EOF
   fi
 
   if [ "$no_initcwnd" = 0 ]; then
-    local gw; gw=$(detect_gw)
-    if [ -n "$gw" ]; then
-      if ip route replace default via "$gw" dev "$iface" initcwnd 32 initrwnd 32 2>/dev/null; then
-        mkdir -p "$STATE_DIR"; : > "$INITCWND_MARKER"
-        ok "initcwnd/initrwnd = 32"
-      else
-        warn "initcwnd not applied (unsupported on some hypervisors)"
-      fi
-      if [ -d /etc/networkd-dispatcher/routable.d ]; then
-        cat > "$ROUTE_HOOK" <<'H'
+    if route_set_initcwnd 32; then
+      mkdir -p "$STATE_DIR"; : > "$INITCWND_MARKER"
+      ok "initcwnd/initrwnd = 32"
+    else
+      warn "initcwnd not applied (unsupported on some hypervisors)"
+    fi
+    write_ppp_hook "$iface" || true
+    if [ -d /etc/networkd-dispatcher/routable.d ]; then
+      cat > "$ROUTE_HOOK" <<'H'
 #!/bin/bash
-GW=$(ip route show default | awk '{print $3; exit}')
-IF=$(ip route show default | awk '{print $5; exit}')
-[ -n "$GW" ] && [ -n "$IF" ] && ip route replace default via "$GW" dev "$IF" initcwnd 32 initrwnd 32
+# 沿用现有路由的全部 token, 只换窗口字段 —— 见主脚本 route_set_initcwnd 的注释.
+R=$(ip -4 route show default 2>/dev/null | head -1)
+[ -n "$R" ] || exit 0
+read -r -a A <<< "$R"; C=(); S=0
+for t in "${A[@]}"; do
+  if [ "$S" = 1 ]; then S=0; continue; fi
+  case "$t" in initcwnd|initrwnd) S=1 ;; *) C+=("$t") ;; esac
+done
+[ "${#C[@]}" -gt 1 ] && ip -4 route replace "${C[@]}" initcwnd 32 initrwnd 32
 exit 0
 H
-        chmod +x "$ROUTE_HOOK"
-      fi
+      chmod +x "$ROUTE_HOOK"
     fi
   elif clear_owned_initcwnd; then
     [ "${INITCWND_CLEARED:-0}" = 1 ] && ok "Low-bandwidth path: tcpfit initcwnd override removed"
@@ -1792,6 +1850,46 @@ qdisc_set_fq(){   # qdisc_set_fq <iface>
   qdisc_is_fq "$iface"
 }
 
+# pppd 每次拨通都会遍历执行 /etc/ppp/ip-up.d/. PPP 接口重拨后是新接口,
+# qdisc 和路由窗口都会丢, 而 tcpfit-qdisc.service 是 oneshot 只在开机跑一次,
+# networkd-dispatcher 又管不到 pppd 拉起的接口.
+# 【整形和 initcwnd 都要靠它】—— 所以 cmd_tune 设了 initcwnd 也要装,
+# 不能只在应用整形时装: 线路没有限速器时不整形, 但 initcwnd 照样需要恢复.
+# 钩子本身两个守卫都会自检, 对应产物不在时是空操作.
+write_ppp_hook(){   # write_ppp_hook <网卡名> [窗口 token...]
+  # 网卡名显式传进来, 不靠 bash 动态作用域去蹭调用方的 local iface ——
+  # 那种隐式依赖一改调用方就静默失效.
+  # 窗口值也要能指定: 恢复存档时用的是存档里的值, 不一定是 32.
+  local iface="$1"; shift
+  local -a win=("$@"); [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  [ -n "$iface" ] || return 1
+  # 目录不存在 = 这台不是 pppd 机器. 返回 1 让调用方知道这条持久化路径不可用,
+  # 好去试别的（networkd-dispatcher）, 而不是当成已经持久化了.
+  # 取 dirname 而不是写死路径 —— 和 ROUTE_HOOK 的处理保持一致, 测试才能重定向.
+  [ -d "$(dirname "$PPP_HOOK")" ] || return 1
+  {
+    printf '#!/bin/sh\n'
+    printf '# tcpfit: pppd 每次拨通后执行, $1 = 接口名.\n'
+    printf '# 用 $1 而不是自己查路由 —— 此刻默认路由未必已经装好.\n'
+    printf '# 只认调优时那块网卡: 机器上可能还有别的 ppp 链路(PPTP/L2TP VPN 之类),\n'
+    printf '# 不加这道判断的话, VPN 一连上就会被套上给 WAN 算的限速值.\n'
+    printf '[ "$1" = %s ] || exit 0\n' "$(printf '%q' "$iface")"
+    printf '[ -x %s ] && TCPFIT_IF="$1" %s >/dev/null 2>&1\n' \
+           "$(printf '%q' "$QDISC_SCRIPT")" "$(printf '%q' "$QDISC_SCRIPT")"
+    printf '# initcwnd: 沿用新路由的全部 token, 只补窗口字段（只在 tcpfit 设过时才做）\n'
+    printf 'if [ -f %s ]; then\n' "$(printf '%q' "$INITCWND_MARKER")"
+    cat <<'H'
+  R=$(ip -4 route show default 2>/dev/null | head -1)
+  D=$(printf '%s' "$R" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  if [ -n "$R" ] && [ -n "$D" ]; then
+    C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"){i++;continue};o=o" "$i};print o}')
+H
+    printf '    [ -n "$C" ] && ip -4 route replace $C%s 2>/dev/null\n' "$(printf ' %s' "${win[@]}")"
+    printf '  fi\nfi\nexit 0\n'
+  } > "$PPP_HOOK" || return 1
+  chmod 755 "$PPP_HOOK"
+}
+
 write_qdisc(){
   local rate="$1" iface="$2"
   cat > "$QDISC_SCRIPT" <<EOF
@@ -1799,7 +1897,9 @@ write_qdisc(){
 # 网卡名动态探测. 写死的话, 服务商换宿主/换槽位导致网卡改名之后
 # 脚本就一直 "Cannot find device" —— 用户只看到服务 failed, 看不出原因.
 # 探测不到才回退到生成时的名字.
-IF=\$(ip -o -4 route show default 2>/dev/null | awk '{print \$5; exit}')
+IF=\${TCPFIT_IF:-}
+[ -n "\$IF" ] || IF=\$(ip -o -4 route show default 2>/dev/null | head -1 |
+      awk '{for(i=1;i<NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
 [ -n "\$IF" ] || IF=${iface}
 RATE=\${1:-${rate}}
 BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
@@ -1822,6 +1922,9 @@ tc class replace dev \$IF parent 1: classid 1:10 htb rate \${RATE}mbit ceil \${R
 tc qdisc replace dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate \${RATE}mbit || exit 1
 EOF
   chmod +x "$QDISC_SCRIPT"
+  # 非 ppp 机器上返回 1 是正常的（没有 /etc/ppp/ip-up.d）, 这里不关心成败.
+  # 显式吞掉而不是靠"调用方没开 set -e" —— 后者一换环境就炸.
+  write_ppp_hook "$iface" || true
   cat > "$QDISC_UNIT" <<EOF
 [Unit]
 Description=tcpfit egress shaper
